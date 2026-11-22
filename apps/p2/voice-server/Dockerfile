@@ -1,12 +1,19 @@
 # p2 speech service (server.py). Models are downloaded at build time into /models; the service runs offline.
 FROM python:3.12-slim
 
-RUN pip install --no-cache-dir sherpa-onnx==1.13.8 onnxruntime==1.31.0 numpy==2.5.4 aiohttp==3.14.5 \
+RUN pip install --no-cache-dir sherpa-onnx==2.0.3 onnxruntime==1.31.0 numpy==2.5.4 aiohttp==3.14.5 \
 	kokoro-onnx==0.6.1 soundfile==0.13.1
 RUN pip install --no-cache-dir torch==2.14.1 pocket-tts==3.3.0 --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Speech to text: Silero VAD + Parakeet TDT 0.6B v3 (int8).
+# Speech to text: Silero VAD + streaming Parakeet Unified English (int8, 560 ms export) for rooms.
 ADD https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx /models/silero_vad.onnx
+ADD https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms.tar.bz2 /tmp/parakeet-streaming.tar.bz2
+RUN echo 'dd2c2698f102eafbf0ee54bdfd7cd842ec00fa6cf2475cbbb048887f794ff52e  /tmp/parakeet-streaming.tar.bz2' | sha256sum -c - \
+	&& python -c "import tarfile; tarfile.open('/tmp/parakeet-streaming.tar.bz2').extractall('/models', filter='data')" \
+	&& mv /models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms /models/parakeet-streaming \
+	&& rm /tmp/parakeet-streaming.tar.bz2
+
+# The legacy /listen endpoint still uses batch Parakeet TDT 0.6B v3 (int8).
 ADD https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2 /tmp/parakeet.tar.bz2
 RUN python -c "import tarfile; tarfile.open('/tmp/parakeet.tar.bz2').extractall('/tmp')" \
 	&& mkdir -p /models/parakeet \
@@ -44,7 +51,7 @@ for name in POCKET_VOICES:
     export_model_state(model.get_state_for_audio_prompt(name), f"/models/pocket/{name}.safetensors")
 PY
 
-COPY segmenter.py server.py test_segmenter.py ./
+COPY recognition.py rooms.py segmenter.py server.py test_recognition.py test_rooms.py test_segmenter.py ./
 ENV PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1
 EXPOSE 8000
 CMD ["python", "server.py"]

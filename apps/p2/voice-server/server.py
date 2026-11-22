@@ -1,4 +1,4 @@
-"""p2 speech service: speech to text (Silero VAD + Parakeet TDT 0.6B v3) and text to speech, on CPU.
+"""p2 speech service: Silero VAD, streaming Parakeet Unified English and text to speech, on CPU.
 
 Every request needs `Authorization: Bearer $VOICE_TOKEN`. p2's voice plugin is the only client: browsers reach this
 service through p2, which signs them in.
@@ -28,7 +28,9 @@ WS   /speak/stream  (primary text-to-speech interface)
                   the engine generates: start, its chunks, then done, or error instead of done if synthesis fails.
                   A cancelled request (queued or running) gets done with cancelled: true and no further chunks.
                   Streaming engines send ~80 ms chunks while generating; the others one chunk per sentence.
-WS   /listen   binary frames: 16 kHz mono PCM16LE microphone audio; text frames: {"type": "reset"}
+WS   /room     p2 conversation voice, identity from the authenticated proxy's X-Room and X-Participant-* headers.
+                  See rooms.py and ../plugins/voice/protocol.ts for the room event and audio shapes.
+WS   /listen   legacy non-streaming Parakeet TDT: 16 kHz mono PCM16LE microphone audio; text frames: {"type": "reset"}
                   replies: {"type": "ready"}, {"type": "speech_start"}, {"type": "speech_end"},
                   {"type": "final", "text", "ms"}
 """
@@ -44,29 +46,38 @@ import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import cache
+from pathlib import Path
 
 import numpy as np
 import sherpa_onnx
 from aiohttp import WSMsgType, web
 
 from engines import VOICE_PATTERN, Engine, load_engines
+from recognition import SAMPLE_RATE, Microphone, load_recognizer
+from rooms import Rooms
 from segmenter import Segmenter
 
 MODELS = os.environ.get("VOICE_MODELS", "/models")
 TOKEN = os.environ["VOICE_TOKEN"]
-SAMPLE_RATE = 16000
 MAX_TEXT = 2000
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-parakeet = f"{MODELS}/parakeet"
-recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-    encoder=f"{parakeet}/encoder.int8.onnx",
-    decoder=f"{parakeet}/decoder.int8.onnx",
-    joiner=f"{parakeet}/joiner.int8.onnx",
-    tokens=f"{parakeet}/tokens.txt",
-    num_threads=4,
-    model_type="nemo_transducer",
-)
+
+@cache
+def offline_recognizer() -> sherpa_onnx.OfflineRecognizer:
+    # /listen and its tests still use the original batch model. /room needs only the streaming model.
+    parakeet = f"{MODELS}/parakeet"
+    return sherpa_onnx.OfflineRecognizer.from_transducer(
+        encoder=f"{parakeet}/encoder.int8.onnx",
+        decoder=f"{parakeet}/decoder.int8.onnx",
+        joiner=f"{parakeet}/joiner.int8.onnx",
+        tokens=f"{parakeet}/tokens.txt",
+        num_threads=4,
+        model_type="nemo_transducer",
+    )
+
+
 engines: dict[str, Engine] = load_engines()
 DEFAULT_ENGINE = os.environ.get("VOICE_DEFAULT_ENGINE", "supertonic")
 if DEFAULT_ENGINE not in engines:
@@ -79,11 +90,11 @@ stt_pool = ThreadPoolExecutor(max_workers=2)
 tts_pool = ThreadPoolExecutor(max_workers=4)
 
 
-def vad_config() -> sherpa_onnx.VadModelConfig:
+def vad_config(silence: float | None = None) -> sherpa_onnx.VadModelConfig:
     config = sherpa_onnx.VadModelConfig()
     config.silero_vad.model = f"{MODELS}/silero_vad.onnx"
     config.silero_vad.threshold = float(os.environ.get("VOICE_VAD_THRESHOLD", "0.5"))
-    config.silero_vad.min_silence_duration = float(os.environ.get("VOICE_VAD_SILENCE", "1.2"))
+    config.silero_vad.min_silence_duration = silence if silence is not None else float(os.environ.get("VOICE_VAD_SILENCE", "1.2"))
     config.silero_vad.min_speech_duration = 0.25
     config.silero_vad.max_speech_duration = 30
     config.silero_vad.window_size = 512
@@ -95,7 +106,7 @@ def vad_config() -> sherpa_onnx.VadModelConfig:
 VAD_PREROLL_MS = float(os.environ.get("VOICE_VAD_PREROLL_MS", "750"))
 
 
-class BadRequest(Exception):
+class BadRequest(ValueError):
     pass
 
 
@@ -144,6 +155,7 @@ def pcm16(audio: np.ndarray) -> bytes:
 
 
 def transcribe(samples: np.ndarray) -> str:
+    recognizer = offline_recognizer()
     stream = recognizer.create_stream()
     stream.accept_waveform(SAMPLE_RATE, samples)
     recognizer.decode_stream(stream)
@@ -181,7 +193,7 @@ async def voices(_request: web.Request) -> web.Response:
 async def speak(request: web.Request) -> web.Response:
     try:
         engine, voice, text, speed = parse_request(await request.json())
-    except (BadRequest, ValueError) as error:
+    except ValueError as error:
         return web.json_response({"error": str(error) or "invalid request"}, status=400)
     started = time.monotonic()
 
@@ -360,16 +372,28 @@ async def listen(request: web.Request) -> web.WebSocketResponse:
     return socket
 
 
-app = web.Application(middlewares=[auth], client_max_size=64 * 1024)
-app.add_routes(
-    [
-        web.get("/health", health),
-        web.get("/voices", voices),
-        web.post("/speak", speak),
-        web.get("/speak/stream", speak_stream),
-        web.get("/listen", listen),
-    ]
-)
+def make_app() -> web.Application:
+    recognizer = load_recognizer(Path(os.environ.get("VOICE_PARAKEET_STREAMING", f"{MODELS}/parakeet-streaming")))
+    rooms = Rooms(
+        lambda: Microphone(recognizer, vad_config, VAD_PREROLL_MS),
+        resolve,
+        {"engine": DEFAULT_ENGINE, "voice": f"{DEFAULT_ENGINE}-{DEFAULT_VOICE}", "speed": None},
+        tts_pool,
+    )
+    app = web.Application(middlewares=[auth], client_max_size=64 * 1024)
+    app.on_shutdown.append(rooms.shutdown)
+    app.add_routes(
+        [
+            web.get("/health", health),
+            web.get("/voices", voices),
+            web.post("/speak", speak),
+            web.get("/speak/stream", speak_stream),
+            web.get("/listen", listen),
+            web.get("/room", rooms.room),
+        ]
+    )
+    return app
+
 
 if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+    web.run_app(make_app(), host=os.environ.get("VOICE_HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8000")))

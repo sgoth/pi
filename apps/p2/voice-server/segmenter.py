@@ -7,6 +7,8 @@ the segment so it starts `preroll_ms` before the detection point. Audio sherpa a
 the pre-roll never reaches back into the previous utterance.
 """
 
+from collections.abc import Iterator
+
 import numpy as np
 import sherpa_onnx
 
@@ -34,7 +36,14 @@ class Segmenter:
 
     def accept(self, samples: np.ndarray) -> list[tuple[str, np.ndarray | None]]:
         """Feeds 16 kHz float32 audio. Returns events: ("speech_start", None) and ("speech_end", utterance)."""
-        events: list[tuple[str, np.ndarray | None]] = []
+        return [
+            (event, audio if event == "speech_end" else None)
+            for event, audio in self.stream(samples)
+            if event != "speech_audio"
+        ]
+
+    def stream(self, samples: np.ndarray) -> Iterator[tuple[str, np.ndarray]]:
+        """Yields pre-roll at speech_start, new windows at speech_audio, and the whole utterance at speech_end."""
         self.pending = np.concatenate([self.pending, samples.astype(np.float32, copy=False)])
         while len(self.pending) >= WINDOW:
             window = self.pending[:WINDOW]
@@ -46,19 +55,24 @@ class Segmenter:
                 drop = len(self.history) - self.keep
                 self.history = self.history[drop:]
                 self.history_start += drop
-            if self.vad.is_speech_detected() and not self.speaking:
+            if self.speaking:
+                yield "speech_audio", window
+            elif self.vad.is_speech_detected():
                 self.speaking = True
                 self.snapshot = (self.fed, self.history_start, self.history.copy())
-                events.append(("speech_start", None))
+                # Sherpa already looks back two windows plus min_speech_duration; streaming needs that audio too.
+                lookback = 2 * WINDOW + int(self.sample_rate * self.config.silero_vad.min_speech_duration)
+                begin = max(self.history_start, self.previous_end, self.fed - max(self.preroll, lookback))
+                yield "speech_start", self.history[begin - self.history_start : ]
             while not self.vad.empty():
                 segment = self.vad.front
                 start = segment.start
                 audio = np.array(segment.samples, dtype=np.float32)
                 self.vad.pop()
                 self.speaking = False
-                events.append(("speech_end", self.extend(start, audio)))
+                utterance = self.extend(start, audio)
                 self.previous_end = start + len(audio)
-        return events
+                yield "speech_end", utterance
 
     def extend(self, start: int, audio: np.ndarray) -> np.ndarray:
         snapshot, self.snapshot = self.snapshot, None

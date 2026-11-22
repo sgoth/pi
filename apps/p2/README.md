@@ -339,8 +339,9 @@ cache entries instead (at twice the input price).
 
 ### Voice mode
 
-Voice mode talks to the agent hands-free: the microphone button in the composer (owner only) streams your speech to a
-speech service, each finished utterance becomes a message, and the agent's answers are read aloud sentence by sentence.
+Voice mode talks to the agent hands-free: the microphone button in the web composer streams your speech to a speech
+service, each finished utterance becomes a message, and the agent's answers are read aloud sentence by sentence.
+On a phone, open p2 over trusted HTTPS and allow microphone access when asked.
 Talking over an answer stops it; "stop" also stops the agent. While it is on, the conversation's prompt asks for short
 spoken answers. The button appears only when `<P2_DATA_DIR>/voice.json` names a speech service:
 
@@ -351,15 +352,19 @@ spoken answers. The button appears only when `<P2_DATA_DIR>/voice.json` names a 
 p2 watches the file: writing, replacing or removing it shows or hides the button in open pages at once, and the
 service's engines and voices are fetched again on each change (the token stays on the server).
 
-The speech service is `voice-server/` (Python, CPU only). Speech to text: Silero VAD and Parakeet TDT 0.6B v3, with
-750 ms of audio before the detected speech start kept (`VOICE_VAD_PREROLL_MS`) so quiet first words survive.
+The speech service is `voice-server/` (Python, CPU only). Its `/room` uses Silero for detecting speech and Parakeet
+Unified English 0.6B (int8, 560 ms streaming export) for interim and final transcripts. The service keeps up to
+750 ms before detected speech (`VOICE_VAD_PREROLL_MS`) so quiet first words survive. The older `/listen` endpoint
+still uses Parakeet TDT 0.6B v3.
 Speech: selectable engines, listed with their voices by `GET /voices`: Supertonic 3 (default; voices F1-F5, M1-M5),
 Kokoro and Kyutai Pocket TTS. Voice ids are `<engine>-<voice>`, for example `supertonic-F1` or `pocket-alba`. The
 `/speak/stream` WebSocket sends 16-bit PCM chunks as they are generated: Pocket TTS streams ~80 ms chunks (first audio
 after ~50-80 ms on slayer), Supertonic and Kokoro send a chunk per sentence (~0.2 s). `POST /speak` returns a WAV.
-`server.py`'s docstring specifies the protocol. On slayer the service runs from `~/voice.mariozechner.at` (`docker
-compose up -d`, token in `.env`); rebuild with `docker build -t p2-voice apps/p2/voice-server`. Browsers never reach
-it directly: p2 proxies `/voice/listen` (WebSocket) and `/voice/speak` for the signed-in owner.
+`server.py`'s docstring specifies the service protocol. Build locally with `docker build -t p2-voice apps/p2/voice-server`
+from the repo root. Supply a private `VOICE_TOKEN`, publish the container's port 8000 on host loopback only, and put
+that loopback URL and token in `voice.json`. On slayer the speech service runs from `~/voice.mariozechner.at` (`docker
+compose up -d`, token in `.env`). Browsers never reach the service directly: p2 proxies `/voice/room` (WebSocket)
+and the owner's `/voice/sample` request.
 
 ## Tests
 
